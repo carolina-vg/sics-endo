@@ -1,0 +1,1127 @@
+---
+title: "Stromal Heterogeneity in the Human Proliferative Endometrium"
+subtitle: "Code v1.1"
+author: "Suzanna Queckbörner, Carolina von Grothusen, Nageswara Rao Boggavarapu, Roy Mathew Francis, Lindsay C. Davies & Kristina Gemzell-Danielsson"
+date: "`r format(Sys.Date(),format='%d-%b-%Y')`"
+output:
+  html_document:
+      toc: true
+      toc_float: true
+      toc_depth: 4
+      number_sections: true
+      theme: flatly
+      highlight: tango
+      df_print: paged
+      code_folding: "none"
+      self_contained: true
+      keep_md: false
+      encoding: 'UTF-8'
+---
+
+```{r,include=FALSE}
+# ignore this chunk
+start_time <- Sys.time()
+
+# load libraries for document creation
+library(knitr) # runs pandoc
+library(captioner) # for table and figure captions
+
+# prepare captions
+tc <- captioner::captioner(prefix="<b>Tab. </b>")
+fc <- captioner::captioner(prefix="<b>Fig. </b>")
+
+# set knit options
+opts_knit$set(progress=TRUE,verbose=TRUE)
+opts_chunk$set(dev="png",results="hold",fig.show="hold",fig.align="left",echo=TRUE,warning=FALSE,message=FALSE,accordion=NULL,block.title=NULL)
+```
+
+# Preparation
+
+Most of the code in this document was executed at the time of it's build. For the code and functions to work, the prerequisites required are data and the tools (environment).
+
+## Environment
+
+The environment and tools are setup using a Conda environment. Install [miniconda](https://docs.conda.io/en/latest/miniconda.html) on your system and create a conda environment using the **environment.yml** file. (Optionally, installing mamba is recommended instead of conda commands for faster resolving time.). This step can take a while. Finally, activate the environment.
+
+```{sh,eval=FALSE}
+conda env create -f environment.yml
+conda activate r-4.0-endo
+```
+
+Next steps are run in R. Install R package `renv`.
+
+```{r,eval=FALSE}
+options(repos="http://cran.r-project.org")
+install.packages("renv")
+```
+
+It's a good idea to make sure that the library path points to the conda environment.
+
+```{r,eval=FALSE}
+.libPaths()
+```
+
+```
+"/home/user/miniconda3/envs/r-4.0-endo/lib/R/library"
+```
+
+Then use renv and **renv.lock** file to install all the R packages needed for analyses.
+
+```{r,eval=FALSE}
+renv::restore(lockfile="renv.lock")
+```
+
+This step can take a while.
+
+## Directory
+
+The initial directory structure required before commencing analyses is shown below. This document (**index.Rmd**) is executed in the project directory.
+
+```
+project/
+├── index.Rmd
+├── data/
+│   ├── processed/
+│   │   ├── fetal-maternal/
+│   │   │   └── emtab-6701.Rds
+│   │   ├── labels-cellsubtype.Rds
+│   │   ├── labels-celltype.Rds
+│   │   └── velocyto/
+│   │       ├── 10X_17_107.loom
+│   │       ├── 10X_17_109.loom
+│   │       └── 10X_18_008.loom
+│   └── raw/
+│       ├── 10X_17_107/
+│       ├── 10X_17_109/
+│       └── 10X_18_008/
+├── environment.yml
+└── renv.lock
+```
+
+- **index.Rmd**: This report source file
+- **data/**: All the data files
+- **data/raw**: Raw data (CellRanger output/10X files)
+- **data/processed/**: All intermediates and outputs 
+- **labels-celltype.Rds, labels-celltype.Rds**: Custom cell type and cell subtype labels
+- **velocyto**: Loom files with spliced, unspliced and ambiguous counts
+- **fetal-maternal**: External data
+- **environment.yml**: Conda environment file
+- **renv.lock**: R package info to restore packages using renv
+
+## Load R packages
+
+```{r}
+set.seed(123)
+
+# load libraries
+library(Seurat) # single-cell
+library(sctransform) # normalisation
+library(MAST) # differential gene expression
+library(SoupX) # estimate and correct background rna
+
+# automated cell type identification
+library(celldex) # reference data
+library(SingleR) # cell type identification
+library(scater) # sc framework
+
+library(BiocManager) # managing bioconductor packages
+
+# rna velocity
+# remotes::install_github("velocyto-team/velocyto.R")
+library(velocyto.R)
+# remotes::install_github('satijalab/seurat-wrappers')
+library(SeuratWrappers)
+
+# external data integration
+library(org.Hs.eg.db) # gene id conversion
+library(clusterProfiler) # gene id conversion
+
+# general
+library(tidyr) # data wrangling
+library(stringr) # data wrangling
+library(dplyr) # data wrangling
+library(ggplot2) # plotting
+library(patchwork) # combining ggplot images
+library(pheatmap) # plotting heatmaps
+library(readxl) # read excel files
+library(writexl) # write excel files
+
+path_wd <- getwd()
+path_export <- file.path(path_wd,"data/processed")
+```
+
+# QC
+## Background
+
+[SoupX](https://github.com/constantAmateur/SoupX) is used to estimate background RNA contamination in each cell/droplet.
+
+```{r,eval=FALSE}
+library(SoupX)
+
+#' @title run_soupx
+#' @description Runs soupx on 10x data data
+#' @param path path to 10X data.
+#' @return Returns a list of soupx object and corrected counts matrix
+#' 
+run_soupx <- function(path=NULL) {
+  
+  message("Running pre-processing & clustering ...")
+  x <- CreateSeuratObject(counts=Seurat::Read10X(file.path(path,"outs/filtered_gene_bc_matrices/hg19"),strip.suffix=F),
+                     min.cells=0,min.features=0,project="endo") %>%
+    NormalizeData() %>%
+    ScaleData() %>%
+    FindVariableFeatures() %>%
+    RunPCA(verbose=FALSE) %>%
+    RunTSNE(dims=1:15) %>%
+    FindNeighbors() %>%
+    FindClusters()
+  
+  message("Running soupx ...")
+  y <- load10X(file.path(path,"outs")) %>%
+        setClusters(setNames(Idents(x), colnames(x))) %>%
+        setDR(slot(x@reductions[["tsne"]],"cell.embeddings")) %>%
+        autoEstCont(doPlot=FALSE)
+  
+  z <- adjustCounts(y,roundToInt=TRUE)
+  
+  return(list("soupx"=y,
+              "corrected"=z))
+  
+}
+```
+
+```{r,eval=FALSE}
+paths <- list.dirs(file.path(path_wd,"data/raw"),recursive=F)
+names(paths) <- basename(paths)
+
+for(i in 1:length(paths)) {
+  message("Running ",names(paths)[i],"...")
+  temp <- run_soupx(paths[i])
+  saveRDS(temp,paste0(path_export,"/soupx/soupx-",names(paths)[i],".Rds"))
+  DropletUtils:::write10xCounts(file.path(path_export,"soupx",names(paths)[i]),temp$corrected,overwrite=TRUE)
+}
+```
+
+Rho estimates
+
+```
+10X_17_107       0.01
+10X_17_109_rerun 0.01
+10X_18_008_rerun 0.03
+```
+
+SoupX is used to estimate background RNA contamination and not used to correct the counts.
+
+## Read data
+
+The 10x data is read into Seurat.
+
+```{r}
+# read data
+paths <- file.path(path_wd,c("data/raw/10X_17_107/outs/filtered_gene_bc_matrices/hg19/",
+           "data/raw/10X_17_109_rerun/outs/filtered_gene_bc_matrices/hg19/",
+           "data/raw/10X_18_008_rerun/outs/filtered_gene_bc_matrices/hg19/"))
+vec <- c("s1"=paths[1],"s2"=paths[2],"s3"=paths[3])
+eu <- CreateSeuratObject(counts=Read10X(data.dir=vec),min.cells=10,min.features=200,project="endo")
+eu
+```
+
+```{r,fig.height=5,fig.width=8}
+p1 <- eu[[]] %>%
+ tibble::rownames_to_column("cell") %>%
+  dplyr::select(orig.ident,nCount_RNA,cell) %>%
+  group_by(orig.ident) %>%
+  arrange(-nCount_RNA) %>%
+  mutate(rank=1:n()) %>%
+  ggplot(aes(x=rank,log10(nCount_RNA),group=orig.ident,colour=orig.ident))+
+  geom_line()+
+  labs(x="Ranked Cells",y="Log10 Reads per cell")+
+  theme(legend.position="top")
+
+p2 <- eu[[]] %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::select(orig.ident,nCount_RNA,cell) %>%
+  group_by(orig.ident) %>%
+  arrange(-nCount_RNA) %>%
+  mutate(rank=1:n()) %>%
+  mutate(rank=scales::rescale(rank,to=c(0,1))) %>%
+  mutate(reads=scales::rescale(log10(nCount_RNA),to=c(0,1))) %>%
+  ggplot(aes(x=rank,reads,col=orig.ident))+
+  geom_line()+
+  labs(x="Ranked Cells Scaled",y="Reads per cell scaled")+
+  theme(legend.position="top")
+
+wrap_plots(p1,p2,guides="collect")&
+  theme(legend.position="top")
+```
+
+`r fc(name="umi_curve",caption="_UMI curve for the three samples. Left shows absolute and Right shows scaled values._")`  
+
+## Mitochondrial
+
+Add percentage of mitochondrial counts.
+
+```{r}
+eu$percent_mito <- PercentageFeatureSet(eu,pattern="^MT-")
+```
+
+```{r,fig.height=3,fig.width=8}
+eu[[]] %>%
+  select(nCount_RNA,nFeature_RNA,percent_mito,orig.ident) %>%
+  pivot_longer(!orig.ident,names_to="metric",values_to="value") %>%
+  ggplot(.,aes(value,fill=orig.ident))+
+  geom_histogram()+
+  facet_wrap(~metric,scales="free")
+```
+
+`r fc(name="qc_reads_genes_mito_histogram",caption="_Histograms of gene counts, number of genes detected and percentage of mitochondrial counts in the non-integrated RNA assay._")`  
+
+```{r,fig.height=8,fig.width=8}
+p1 <- FeatureScatter(eu, feature1="nCount_RNA", feature2="percent_mito")
+p2 <- FeatureScatter(eu, feature1="nFeature_RNA", feature2="percent_mito")
+p3 <- FeatureScatter(eu, feature1="nCount_RNA", feature2="nFeature_RNA")
+wrap_plots(p1,p2,p3,ncol=2)
+```
+
+`r fc(name="qc_reads_genes_mito",caption="_( Top Left) Number of reads per cell vs percentage of mitochondrial reads per cell. (Top Right) Number of genes per cell vs percentage of mitochondrial reads per cell. (Bottom Left) Number of reads per cell vs number of genes detected per cell._")`  
+
+## Cell cycle
+
+```{r}
+# Cell cycle phases using seurat
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+eu <- CellCycleScoring(eu,s.features=s.genes,g2m.features=g2m.genes,set.ident=TRUE)
+eu$cc.diff <- eu$S.Score-eu$G2M.Score
+as.data.frame(table(eu$Phase))
+```
+
+```{r}
+table(eu$orig.ident,eu$Phase)
+```
+
+```{r,fig.height=5,fig.width=6}
+eu[[]] %>%
+  ggplot(aes(x=S.Score,y=G2M.Score,color=Phase))+
+  geom_point(size=0.8,alpha=0.6)+
+  labs(x="s",y="g2m",title="Seurat")
+```
+
+`r fc(name="qc_phase",caption="_Scatterplot showing S.Scores and G2M.Scores as well as assigned phases._")`  
+
+```{r}
+saveRDS(eu,file.path(path_export,"seurat-1-raw.Rds"))
+```
+
+## Filtering
+
+Remove ERCC, RPL and RPS genes. And remove cells that are doublets, have less than 200 features, more than 5000 features and percentage mitochondrial reads greater than 10%.
+
+```{r}
+eu <- subset(eu,features = grep(pattern="^ERCC|^RPL|^RPS",x=rownames(as.matrix(GetAssayData(eu))),value=TRUE,invert=T))
+eu <- subset(eu, subset=nFeature_RNA > 200 & nFeature_RNA < 5000 & percent_mito < 10)
+eu <- subset(eu,cells=names(readRDS(file.path(path_export,"labels-celltype.Rds"))))
+eu
+```
+
+# Data integration
+
+The three samples are integrated to remove the effect of individuals.
+
+```{r,results="hide"}
+library(sctransform)
+eu.list <- SplitObject(eu,split.by="orig.ident")
+
+for (i in 1:length(eu.list)) {
+    eu.list[[i]] <- SCTransform(eu.list[[i]],return.only.var.genes=F,
+                                vars.to.regress=c("percent_mito","cc.diff"))
+}
+
+eu.features <- SelectIntegrationFeatures(eu.list,nfeatures=3000)
+eu.list <- Seurat::PrepSCTIntegration(eu.list,anchor.features=eu.features)
+eu.anchors <- FindIntegrationAnchors(object.list=eu.list,normalization.method="SCT",anchor.features=eu.features)
+e <- IntegrateData(anchorset=eu.anchors,normalization.method="SCT")
+e$nFeature_INT <- Matrix::colSums(GetAssayData(e,assay="integrated")>0)
+e$nCount_INT <- Matrix::colSums(GetAssayData(e,assay="integrated"))
+DefaultAssay(e) <- "integrated"
+Idents(e) <- e$orig.ident
+```
+
+```{r}
+saveRDS(e,file.path(path_export,"seurat-2-integrated.Rds"))
+rm(eu,eu.anchors,eu.features,eu.list)
+e
+```
+
+# Dimensionality reduction
+
+Dimensionality reduction methods including PCA, tSNE and UMAP.
+
+```{r,fig.height=5.5,fig.width=6}
+e <- RunPCA(e,assay="integrated",verbose=F,seed.use=42)
+PCAPlot(e)
+```
+
+`r fc(name="dr_pca",caption="_PCA scatterplot coloured by sample._")`  
+
+```{r,fig.height=5,fig.width=5}
+ElbowPlot(e,ndims=50)
+```
+
+`r fc(name="dr_elbow",caption="_Elbow plot to estimate number of PCs to retain in downstream analyses._")`  
+
+```{r,fig.height=3.5,fig.width=7}
+e <- RunTSNE(e,dims=1:18,seed.use=100)
+e <- RunUMAP(e,dims=1:18,seed.use=100)
+
+p1 <- TSNEPlot(e,group.by="orig.ident")
+p2 <- UMAPPlot(e,group.by="orig.ident")
+(p1|p2)
+```
+
+`r fc(name="dr_tsne_2",caption="_Left: tSNE scatterplot showing the identity of the three samples. Right: UMAP scatterplot showing the identity of the three samples._")`  
+
+```{r,fig.height=6.3,fig.width=7}
+p1 <- FeaturePlot(e,red="tsne",features="nFeature_RNA")
+p2 <- FeaturePlot(e,red="tsne",features="percent_mito")
+p3 <- FeaturePlot(e,red="tsne",features="S.Score")
+p4 <- FeaturePlot(e,red="tsne",features="G2M.Score")
+(p1|p2)/(p3|p4)
+```
+
+`r fc(name="dr_tsne_4",caption="_tSNE plot showing; Top left: number of genes detected per cell, Top right: percentage mitochondrial content in cells, Bottom Left: S phase cells, Bottom Right: G2/M phase cells._")`  
+
+# Cell type
+## Clustering
+
+A network graph is built using nearest neighbors. Louvain clustering is used to find communities/clusters on this graph.
+
+```{r,fig.height=5.5,fig.width=6}
+e <- FindNeighbors(e,dims=1:20)
+e <- FindClusters(e,resolution=0.2,random.seed=0)
+TSNEPlot(e)
+```
+
+`r fc(name="ct_tsne_seurat_clusters",caption="_tSNE scatterplot with clusters identified by Seurat (Louvain clustering)._")` 
+
+## Manual
+
+Manual cell type identification using known marker genes.
+
+```{r,fig.height=6,fig.width=8}
+VlnPlot(e,features=c("VWF","EPCAM","PTPRC","CXCL12","CD14","CD27",
+                     "RGS5","TYMS","TOP2A","GNLY"),pt.size=0)
+```
+
+`r fc(name="ct_vlnplot",caption="_Violin plot showing expression of known marker genes in various clusters._")` 
+
+```{r,fig.height=11,fig.width=6}
+FeaturePlot(e,features=c("VWF","EPCAM","PTPRC","CXCL12","CD14","CD27"),
+            reduction="tsne")&
+  theme(legend.position="top",
+        legend.direction="horizontal",
+        legend.justification=0.5)
+```
+
+`r fc(name="ct_featureplot",caption="_tSNE scatterplot showing expression of known marker genes in various clusters. The colour denotes the level of expression with bright blue indicating higher expression in that cell._")` 
+
+## SingleR
+
+Automated cell type identification using SingleR. SingleR was run using two different reference datasets: HPCA (Human Primary Cell Atlas) and BPE (Blue Print ENCODE).
+
+```{r}
+set.seed(123)
+library(celldex)
+hpca <- celldex::HumanPrimaryCellAtlasData()
+bpe <- celldex::BlueprintEncodeData()
+  
+library(scater)
+library(SingleR)
+
+pred_hpca <- SingleR(test=GetAssayData(e,slot="data",assay="integrated"),ref=hpca,labels=hpca$label.main)
+table(pred_hpca$labels)
+e$hpca <- pred_hpca$labels
+
+pred_bpe <- SingleR(test=GetAssayData(e,slot="data",assay="integrated"),ref=bpe,labels=bpe$label.main)
+table(pred_bpe$labels)
+e$bpe <- pred_bpe$labels
+
+rm(hpca,bpe,pred_hpca,pred_bpe)
+```
+
+```{r,fig.height=9,fig.width=7}
+TSNEPlot(e,group.by="hpca")+
+  guides(colour=guide_legend(nrow=12,override.aes=list(size=2)))+
+  theme(legend.position="top")
+```
+
+`r fc(name="ct_tsne_hpca",caption="_tSNE scatterplot showing cell types predicted by SingleR using HPCA (Human Primary Cell Atlas) reference._")` 
+
+```{r,fig.height=9,fig.width=7}
+TSNEPlot(e,group.by="bpe")+
+  guides(colour=guide_legend(nrow=9,override.aes=list(size=2)))+
+  theme(legend.position="top")
+```
+
+`r fc(name="ct_tsne_bpe",caption="_tSNE scatterplot showing cell types predicted by SingleR using BPE (Blue Print ENCODE) reference._")` 
+
+## Cluster labels
+
+The final high level cluster labels are designated based on the previous information. In our case, we will read in predefined labels.
+
+
+```{r,fig.height=4,fig.width=6}
+e$cell_type <- readRDS(file.path(path_export,"labels-celltype.Rds"))
+e$cell_subtype <- readRDS(file.path(path_export,"labels-cellsubtype.Rds"))
+
+Idents(e) <- e$cell_type
+TSNEPlot(e)
+```
+
+`r fc(name="ct_scatter_final_labels",caption="_tSNE and UMAP scatterplots showing the high level designated labels on clusters._")` 
+
+```{r,echo=FALSE}
+saveRDS(e,file.path(path_export,"seurat-3-full.Rds"))
+```
+
+## Marker discovery
+
+Markers are discovered for the defined clusters/cell types through differential gene expression (DE). DE comparisons are performed between each cluster vs all other cells.
+
+```{r,fig.height=4,fig.width=8}
+
+m <- FindAllMarkers(e,test.use="MAST",only.pos=TRUE,min.pct=0.25,
+                 logfc.threshold=1,max.cells.per.ident=500,
+                 min.cells.group=10,random.seed=100,return.thresh=0.05,
+                 assay="SCT",slot="data")
+
+m1 <- m %>% 
+  filter(p_val_adj<0.05) %>%
+  group_by(cluster) %>% 
+  top_n(n=5,wt=abs(avg_logFC)) %>%
+  arrange(cluster,-abs(avg_logFC))
+```
+
+```{r,fig.height=7,fig.width=5}
+# dotplot
+DotPlot(e,features=m1$gene)+
+  coord_flip()+
+  labs(x="",y="")+
+  theme_bw(base_size=7)+
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+`r fc(name="ct_dotplot_novel_markers",caption="_Dotplot showing top 5 (ranked by avg log2 fold change) marker genes discovered through DE. Colour denotes mean expression level. Stronger colour denotes higher expression. The size of the circles denote precentage of cells within that cluster that show expression._")` 
+
+```{r,fig.height=6,fig.width=7}
+DoHeatmap(subset(e,downsample=200),features=m1$gene,)
+```
+
+`r fc(name="ct_heatmap_novel_markers",caption="_Top 5 (as in previous figure) marker genes discovered through DE is now shown as a heatmap. Rows denote genes and columns denote cells. Cells have been downsampled to maximum 200 cells per cluster to show a balanced view of all clusters._")` 
+
+```{r,echo=FALSE}
+writexl::write_xlsx(list("markers_mast"=as.data.frame(m),
+                         "markers_mast_top5"=as.data.frame(m1)),
+                    path=file.path(path_export,"markers.xlsx"),
+                    col_names=T)
+rm(m,m1)
+```
+
+Overview of number of cells and categories.
+
+```{r}
+table(e$orig.ident)
+table(e$cell_type)
+table(e$cell_subtype)
+table(e$orig.ident,e$cell_type)
+table(e$orig.ident,e$cell_subtype)
+```
+
+# Subset
+
+Previously defined clusters were subsetted and reanalyzed using similar workflow for higher resolution.
+
+## Stromal+Pericyte
+
+```{r,results="hide"}
+estpu <- subset(e,cells=names(e$cell_type[e$cell_type=="Stromal"|e$cell_type=="Pericyte"]))
+DefaultAssay(estpu) <- "RNA"
+estpu <- DietSeurat(estpu,assays="RNA",counts=TRUE,scale.data=FALSE)
+estpu$percent_mito <- PercentageFeatureSet(estpu, pattern="^MT-")
+
+estpu.list <- SplitObject(estpu,split.by="orig.ident")
+for (i in 1:length(estpu.list)) {
+    estpu.list[[i]] <- SCTransform(estpu.list[[i]],return.only.var.genes=F,vars.to.regress=c("percent_mito","cc.diff"))
+}
+estpu.features <- SelectIntegrationFeatures(estpu.list,nfeatures=3000)
+estpu.list <- Seurat::PrepSCTIntegration(estpu.list,anchor.features=estpu.features)
+estpu.anchors <- FindIntegrationAnchors(object.list=estpu.list,normalization.method="SCT",anchor.features=estpu.features)
+estp <- IntegrateData(anchorset=estpu.anchors,normalization.method="SCT")
+
+estp <- RunPCA(estp,verbose=F,seed.use=100)
+estp <- RunTSNE(estp,dims=1:28,seed.use=100)
+estp <- RunUMAP(estp,dims=1:28,seed.use=100)
+estp <- FindNeighbors(estp,dims=1:28)
+estp <- FindClusters(estp,resolution=0.8,random.seed=0)
+```
+
+```{r}
+rm(estpu,estpu.anchors,estpu.features,estpu.list)
+estp
+```
+
+```{r,fig.height=6.8,fig.width=7}
+p1 <- TSNEPlot(estp)
+p2 <- TSNEPlot(estp,group.by="orig.ident")
+p3 <- FeaturePlot(estp,red="tsne",features="percent_mito")
+p4 <- FeaturePlot(estp,red="tsne",features="S.Score")
+(p1|p2)/(p3|p4)
+```
+
+`r fc(name="subset_stromapericyte_tsne_4",caption="_Top left: tSNE plot showing clusters identified by Seurat. Top right: TSNE plot showing the original samples. Bottom left: tSNE plot showing percentage mitochondrial content in cells. Bottom right: tSNE plot showing dividing cells._")` 
+
+Pre-defined labels are used to define clusters.
+
+```{r}
+Idents(estp) <- estp$cell_subtype
+TSNEPlot(estp)
+```
+
+`r fc(name="subset_stromapericyte_tsne_1",caption="_tSNE plot showing custom clusters._")` 
+
+### Markers
+
+Marker genes are identified between all clusters by DE testing.
+
+```{r,fig.height=4,fig.width=8}
+estp_markers_mast <- FindAllMarkers(estp,test.use="MAST",only.pos=TRUE,min.pct=0.25,
+                 logfc.threshold=0.25,max.cells.per.ident=500,
+                 min.cells.group=10,random.seed=100,return.thresh=0.05,
+                 assay="SCT",slot="data")
+
+estp_markers_mast1 <- estp_markers_mast %>% 
+  filter(p_val_adj<0.05) %>%
+  group_by(cluster) %>% 
+  top_n(n=5,wt=abs(avg_logFC)) %>%
+  arrange(cluster,-abs(avg_logFC))
+```
+
+```{r,fig.height=7,fig.width=5}
+DotPlot(estp,features=unique(estp_markers_mast1$gene))+
+  coord_flip()+
+  labs(x="",y="")+
+  ggtitle("MAST")+
+  theme_bw(base_size=7)+
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+```
+
+`r fc(name="subset_stromapericyte_dotplot",caption="_Dotplot showing marker genes within stromal sub clusters. Colour denotes mean expression level. Stronger colour denotes higher expression. The size of the circles denote precentage of cells within that cluster that show expression._")` 
+
+```{r,fig.height=8,fig.width=6.5}
+estp_markers_mast2 <- estp_markers_mast %>% 
+  filter(p_val_adj<0.05) %>%
+  group_by(cluster) %>% 
+  top_n(n=1,wt=abs(avg_logFC)) %>%
+  arrange(cluster,-abs(avg_logFC))
+
+FeaturePlot(estp,features=unique(estp_markers_mast2$gene),reduction="tsne")&
+  theme(legend.position="top",
+        legend.direction="horizontal",
+        legend.justification=0.5)
+```
+
+`r fc(name="subset_stromapericyte_featureplot",caption="_Dotplot showing marker genes within stromal sub clusters. Colour denotes mean expression level. Stronger colour denotes higher expression. The size of the circles denote precentage of cells within that cluster that show expression._")` 
+
+```{r,fig.height=5,fig.width=8}
+DoHeatmap(subset(estp,downsample=200),features=unique(estp_markers_mast1$gene))
+```
+
+`r fc(name="subset_stromapericyte_novel_markers",caption="_Top 5 (as in previous figure) marker genes discovered through DE is now shown as a heatmap. Rows denote genes and columns denote cells. Cells have been downsampled to maximum 200 cells per cluster to show a balanced view of all clusters._")` 
+
+```{r,echo=FALSE}
+writexl::write_xlsx(list("markers_mast"=as.data.frame(estp_markers_mast),
+                         "markers_mast_top5"=as.data.frame(estp_markers_mast1)),
+                    path=file.path(path_export,"markers-stroma-pericyte.xlsx"),
+                    col_names=T)
+rm(estp_markers_mast,estp_markers_mast1)
+```
+
+```{r}
+table(estp$orig.ident)
+table(estp$cell_type)
+table(estp$cell_subtype)
+table(estp$orig.ident,estp$cell_type)
+table(estp$orig.ident,estp$cell_subtype)
+```
+
+```{r,echo=FALSE}
+saveRDS(estp,file.path(path_export,"seurat-4-stromapericyte.Rds"))
+```
+
+## Stromal
+
+```{r,results="hide"}
+estu <- subset(e,cells=names(e$cell_type[e$cell_type=="Stromal"]))
+DefaultAssay(estu) <- "RNA"
+estu <- DietSeurat(estu,assays="RNA",counts=TRUE,scale.data=FALSE)
+estu$percent_mito <- PercentageFeatureSet(estu, pattern="^MT-")
+
+estu.list <- SplitObject(estu,split.by="orig.ident")
+for (i in 1:length(estu.list)) {
+    estu.list[[i]] <- SCTransform(estu.list[[i]],return.only.var.genes=F,vars.to.regress=c("percent_mito","cc.diff"))
+}
+estu.features <- SelectIntegrationFeatures(estu.list,nfeatures=3000)
+estu.list <- Seurat::PrepSCTIntegration(estu.list,anchor.features=estu.features)
+estu.anchors <- FindIntegrationAnchors(object.list=estu.list,normalization.method="SCT",anchor.features=estu.features)
+est <- IntegrateData(anchorset=estu.anchors,normalization.method="SCT")
+
+est <- RunPCA(est,verbose=F,seed.use=100)
+est <- RunTSNE(est,dims=1:28,seed.use=100)
+est <- RunUMAP(est,dims=1:28,seed.use=100)
+est <- FindNeighbors(est,dims=1:28)
+est <- FindClusters(est,resolution=0.8,random.seed=0)
+```
+
+```{r}
+rm(estu,estu.anchors,estu.features,estu.list)
+est
+```
+
+```{r,fig.height=6.8,fig.width=7}
+p1 <- TSNEPlot(est)
+p2 <- TSNEPlot(est,group.by="orig.ident")
+p3 <- FeaturePlot(est,red="tsne",features="percent_mito")
+p4 <- FeaturePlot(est,red="tsne",features="S.Score")
+(p1|p2)/(p3|p4)
+```
+
+`r fc(name="subset_stroma_tsne_4",caption="_Top left: tSNE plot showing clusters identified by Seurat. Top right: TSNE plot showing the original samples. Bottom left: tSNE plot showing percentage mitochondrial content in cells. Bottom right: tSNE plot showing dividing cells._")` 
+
+Pre-defined labels are used to define clusters.
+
+```{r}
+Idents(est) <- est$cell_subtype
+TSNEPlot(est)
+```
+
+`r fc(name="subset_stroma_tsne_1",caption="_tSNE plot showing custom clusters._")` 
+
+### Markers
+
+Marker genes are identified between all clusters by DE testing.
+
+```{r,fig.height=4,fig.width=8}
+est_markers_mast <- FindAllMarkers(est,test.use="MAST",only.pos=TRUE,min.pct=0.25,
+                 logfc.threshold=0.25,max.cells.per.ident=500,
+                 min.cells.group=10,random.seed=100,return.thresh=0.05,
+                 assay="SCT",slot="data")
+
+est_markers_mast1 <- est_markers_mast %>% 
+  filter(p_val_adj<0.05) %>%
+  group_by(cluster) %>% 
+  top_n(n=6,wt=abs(avg_logFC)) %>%
+  arrange(cluster,-abs(avg_logFC))
+```
+
+```{r,fig.height=7,fig.width=5}
+DotPlot(est,features=unique(est_markers_mast1$gene))+
+  coord_flip()+
+  labs(x="",y="")+
+  ggtitle("MAST")+
+  theme_bw(base_size=7)+
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+```
+
+`r fc(name="subset_stroma_dotplot",caption="_Dotplot showing marker genes within stromal sub clusters. Colour denotes mean expression level. Stronger colour denotes higher expression. The size of the circles denote precentage of cells within that cluster that show expression._")` 
+
+```{r,fig.height=8,fig.width=6.5}
+est_markers_mast2 <- est_markers_mast %>% 
+  filter(p_val_adj<0.05) %>%
+  group_by(cluster) %>% 
+  top_n(n=1,wt=abs(avg_logFC)) %>%
+  arrange(cluster,-abs(avg_logFC))
+
+FeaturePlot(est,features=unique(est_markers_mast2$gene),reduction="tsne")&
+  theme(legend.position="top",
+        legend.direction="horizontal",
+        legend.justification=0.5)
+```
+
+`r fc(name="subset_stroma_featureplot",caption="_Dotplot showing marker genes within stromal sub clusters. Colour denotes mean expression level. Stronger colour denotes higher expression. The size of the circles denote precentage of cells within that cluster that show expression._")` 
+
+```{r,fig.height=5,fig.width=8}
+DoHeatmap(subset(est,downsample=200),features=unique(est_markers_mast1$gene))
+```
+
+`r fc(name="subset_stroma_novel_markers",caption="_Top 5 (as in previous figure) marker genes discovered through DE is now shown as a heatmap. Rows denote genes and columns denote cells. Cells have been downsampled to maximum 200 cells per cluster to show a balanced view of all clusters._")` 
+
+```{r,echo=FALSE}
+writexl::write_xlsx(list("markers_mast"=as.data.frame(est_markers_mast),
+                         "markers_mast_top5"=as.data.frame(est_markers_mast1)),
+                    path=file.path(path_export,"markers-stroma.xlsx"),
+                    col_names=T)
+rm(est_markers_mast,est_markers_mast1)
+```
+
+```{r}
+table(est$orig.ident)
+table(est$cell_type)
+table(est$cell_subtype)
+table(est$orig.ident,est$cell_type)
+table(est$orig.ident,est$cell_subtype)
+```
+
+```{r,echo=FALSE}
+saveRDS(est,file.path(path_export,"seurat-5-stroma.Rds"))
+```
+
+## Pericyte
+
+Data is not integrated due to insufficient number of cells in this dataset. Individual effect is instead corrected through `vars.to.regress`. 
+
+```{r}
+# reanalyse pericytes
+ep <- subset(e,cells=names(e$cell_type[e$cell_type=="Pericyte"]))
+DefaultAssay(ep) <- "RNA"
+ep <- DietSeurat(ep,assay="RNA")
+ep$percent_mito <- PercentageFeatureSet(ep, pattern="^MT-")
+ep <- NormalizeData(ep)
+ep <- ScaleData(ep,vars.to.regress=c("orig.ident","percent_mito","cc.diff"))
+ep <- FindVariableFeatures(ep,selection.method="vst",nfeatures=5000)
+ep <- RunPCA(ep,verbose=F,seed.use=100)
+ep <- RunTSNE(ep,dims=1:13,seed.use=100)
+ep <- RunUMAP(ep,dims=1:13,seed.use=100)
+ep <- FindNeighbors(ep,dims=1:11)
+ep <- FindClusters(ep,resolution=1.4,random.seed=0)
+```
+
+```{r,fig.height=7,fig.width=8}
+p1 <- TSNEPlot(ep)
+p2 <- TSNEPlot(ep,group.by="orig.ident")
+p3 <- FeaturePlot(ep,red="tsne",features="percent_mito")
+p4 <- FeaturePlot(ep,red="tsne",features="S.Score")
+(p1|p2)/(p3|p4)
+```
+
+`r fc(name="subset_pericyte_tsne_4",caption="_Top left: tSNE plot showing clusters identified by Seurat. Top right: TSNE plot showing the original samples. Bottom left: tSNE plot showing percentage mitochondrial content in cells. Bottom right: tSNE plot showing dividing cells._")` 
+
+Pre-defined labels are used to define clusters.
+
+```{r,fig.height=5,fig.width=6}
+Idents(ep) <- ep$cell_subtype
+TSNEPlot(ep)
+```
+
+`r fc(name="subset_pericyte_tsne_1",caption="_tSNE plot showing custom clusters._")` 
+
+### Markers
+
+Marker genes are identified between all clusters by DE testing.
+
+```{r,fig.height=4,fig.width=8}
+ep_markers_mast <- FindAllMarkers(ep,test.use="MAST",only.pos=TRUE,
+                                  min.pct=0.25,logfc.threshold=0.25,
+                 min.cells.group=10,random.seed=100,return.thresh=0.05,
+                 assay="RNA",slot="data",latent.vars=c("orig.ident","percent_mito","cc.diff"))
+
+ep_markers_mast1 <- ep_markers_mast %>% 
+  filter(p_val_adj<0.05) %>%
+  group_by(cluster) %>% 
+  top_n(n=5,wt=abs(avg_logFC)) %>%
+  arrange(cluster,-abs(avg_logFC))
+```
+
+```{r,fig.height=5,fig.width=4}
+DotPlot(ep,features=unique(ep_markers_mast1$gene))+
+  coord_flip()+
+  labs(x="",y="")+
+  theme_bw(base_size=7)+
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+```
+
+`r fc(name="subset_pericyte_dotplot",caption="_Dotplot showing marker genes within stromal sub clusters. Colour denotes mean expression level. Stronger colour denotes higher expression. The size of the circles denote precentage of cells within that cluster that show expression._")` 
+
+```{r,fig.height=5,fig.width=7}
+DoHeatmap(ep,features=ep_markers_mast1$gene)
+```
+
+`r fc(name="subset_pericyte_novel_markers",caption="_Top 5 (as in previous figure) marker genes discovered through DE is now shown as a heatmap. Rows denote genes and columns denote cells._")` 
+
+```{r,echo=FALSE}
+writexl::write_xlsx(list("markers_mast"=as.data.frame(ep_markers_mast),
+                         "markers_mast_top5"=as.data.frame(ep_markers_mast1)),
+                    path=file.path(path_export,"markers-pericyte.xlsx"),
+                    col_names=T)
+rm(ep_markers_mast,ep_markers_mast1)
+```
+
+```{r}
+table(ep$orig.ident)
+table(ep$cell_type)
+table(ep$cell_subtype)
+table(ep$orig.ident,ep$cell_type)
+table(ep$orig.ident,ep$cell_subtype)
+```
+
+```{r,echo=FALSE}
+saveRDS(ep,file.path(path_export,"seurat-6-pericyte.Rds"))
+```
+
+# Velocyto
+
+RNA velocity was estimate using the tool Velocyto. Velocyto was run through a docker container retrieved from dockerhub repository  ([genomicpariscentre/velocyto](https://hub.docker.com/r/genomicpariscentre/velocyto)). The 10X directories (CellRanger output) including BAM files and hg19 annotations were provided as input. The output was loom files with three assays: spliced, unspliced and ambiguous counts.
+
+```{sh,eval=FALSE}
+# code not evaluated
+
+docker pull genomicpariscentre/velocyto
+docker run -v /project/data/raw:/home/ --name 10X_17_107 genomicpariscentre/velocyto velocyto run10x /home/10X_17_107/ /home/hg19-1.2.0-genes.gtf
+docker run -v /project/data/raw:/home/ --name 10X_17_109 genomicpariscentre/velocyto velocyto run10x /home/10X_17_109/ /home/hg19-1.2.0-genes.gtf
+docker run -v /project/data/raw:/home/ --name 10X_18_008 genomicpariscentre/velocyto velocyto run10x /home/10X_18_008/ /home/hg19-1.2.0-genes.gtf
+```
+    
+Read loom files with spliced, unspliced and ambiguous counts. Labels are corrected and converted to Seurat objects.
+
+```{r}
+set.seed(123)
+library(velocyto.R)
+library(SeuratWrappers)
+
+s1 <- read.loom.matrices("./data/processed/velocyto/10X_17_107.loom")
+s2 <- read.loom.matrices("./data/processed/velocyto/10X_17_109.loom")
+s3 <- read.loom.matrices("./data/processed/velocyto/10X_18_008.loom")
+
+colnames(s1$spliced) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s1$spliced),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+colnames(s2$spliced) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s2$spliced),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+colnames(s3$spliced) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s3$spliced),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+
+colnames(s1$unspliced) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s1$unspliced),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+colnames(s2$unspliced) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s2$unspliced),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+colnames(s3$unspliced) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s3$unspliced),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+
+colnames(s1$ambiguous) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s1$ambiguous),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+colnames(s2$ambiguous) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s2$ambiguous),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+colnames(s3$ambiguous) <- paste0(stringr::str_replace(stringr::str_replace(stringr::str_replace(stringr::str_replace(colnames(s3$ambiguous),"^10X_17_107:","s1_"),"^10X_17_109_rerun:","s2_"),"^10X_18_008_rerun:","s3_"),"x$",""),"-1")
+
+s1 <- as.Seurat(s1)
+s2 <- as.Seurat(s2)
+s3 <- as.Seurat(s3)
+```
+
+Runs are merged into a single object. Default assay is set to spliced. Cell types of interest are subsetted to create a new object. Standard Seurat processing is performed followed by dimensionality reduction and custom cell labels are added.
+
+```{r}
+sx <- merge(s1,y=c(s2,s3),project="endo")
+DefaultAssay(sx) <- "spliced"
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+sx <- CellCycleScoring(sx,s.features=s.genes,g2m.features=g2m.genes,set.ident=F)
+sx$cc.diff <- sx$S.Score-sx$G2M.Score
+sx$percent_mito <- PercentageFeatureSet(sx, pattern="^MT-")
+
+# subset data
+vsp <- subset(sx,cells=names(e$cell_type[e$cell_subtype=="ACTA2+" | e$cell_subtype=="THY1+" | e$cell_subtype=="Pericyte1" | e$cell_subtype=="Pericyte2"]))
+vsp <- subset(vsp,subset=nFeature_spliced>200 & nFeature_spliced<5000 & percent_mito<10)
+vsp <- subset(vsp,features=grep(pattern="^ERCC|^RPL|^RPS",x=rownames(as.matrix(GetAssayData(vsp))),value=TRUE,invert=T))
+
+vsp <- NormalizeData(vsp)
+vsp <- ScaleData(vsp,vars.to.regress=c("orig.ident","percent_mito","cc.diff"))
+vsp <- ScaleData(vsp,vars.to.regress=c("orig.ident","percent_mito","cc.diff"),assay = "unspliced")
+vsp <- FindVariableFeatures(vsp,selection.method="vst")
+vsp <- FindVariableFeatures(vsp,selection.method="vst",assay ="unspliced")
+vsp <- RunPCA(vsp,seed.use=42,verbose=FALSE)
+vsp <- RunPCA(vsp,seed.use=42,verbose=FALSE,assay="unspliced")
+vsp <- RunTSNE(vsp,dims=1:12,seed.use=100)
+vsp <- RunTSNE(vsp,dims=1:15,seed.use=100,assay="unspliced")
+vsp <- RunUMAP(vsp,dims=1:12,seed.use=100)
+vsp <- RunUMAP(vsp,dims=1:15,seed.use=100,assay="unspliced")
+
+vsp$cell_type <- e$cell_type
+vsp$cell_subtype <- e$cell_subtype
+Idents(vsp) <- factor(as.character(vsp$cell_subtype),levels=c("ACTA2+","THY1+","Pericyte1","Pericyte2"))
+```
+
+```{r}
+rm(s1,s2,s3,sx,s.genes,g2m.genes)
+```
+
+RNA velocity is run through Seurat wrapper function and velocity estimates are visualized as vector fields.
+
+```{r}
+vsp <- RunVelocity(vsp,deltaT=1,kCells=25,fit.quantile=0.02)
+#saveRDS(vsp,file.path(path_export,"velocyto-stromapericyte.Rds"))
+```
+
+```{r}
+ident.colors <- c('#95CC5EFF',"#5C88DAFF",'#017A4AFF','#FFCE4EFF')
+names(ident.colors) <- levels(vsp)
+cell.colors <- ident.colors[Idents(vsp)]
+names(cell.colors) <- colnames(vsp)
+
+n <- 1:length(colnames(vsp))
+#n <- sample(1:length(colnames(vsp)),200,replace=F)
+
+png(file.path(path_export,"velocyto-stromapericyte-umap.png"),height=16,width=15,units="cm",res=300)
+show.velocity.on.embedding.cor(emb=Embeddings(object=vsp, reduction="umap")[n,]/2, vel=Tool(object=subset(vsp,cells=colnames(vsp)[n]), slot="RunVelocity"), n=250, scale="sqrt", cell.colors=ac(x=cell.colors, alpha=0.5), cex=0.8, arrow.scale=2, show.grid.flow=TRUE, min.grid.cell.mass=0.5, grid.n=40, arrow.lwd=0.8,do.par=FALSE, cell.border.alpha=0.1,n.cores=8)
+#text(x=c(1.5,3.2,1.7,3.5,-1.2,0.15,0),y=c(-1,-0.3,1.1,1.8,2.0,2.4,3.1),labels=c("Stroma","Immune2","Epithelial","Immune1","Pericyte","Cycling Stroma","Endothelial"),cex=0.9)
+legend("topright",legend=levels(vsp),pch=20,col=ident.colors,bty="n",pt.cex=1,cex=0.6)
+title(main="Velocyto: RNA velocity on UMAP projection")
+dev.off()
+
+png(file.path(path_export,"velocyto-stromapericyte-tsne.png"),height=16,width=15,units="cm",res=300)
+show.velocity.on.embedding.cor(emb=Embeddings(object=vsp, reduction="tsne")[n,]/12, vel=Tool(object=subset(vsp,cells=colnames(vsp)[n]), slot="RunVelocity"), n=250, scale="sqrt", cell.colors=ac(x=cell.colors, alpha=0.5), cex=0.8, arrow.scale=2.5, show.grid.flow=TRUE, min.grid.cell.mass=0.5, grid.n=40, arrow.lwd=0.8,do.par=FALSE, cell.border.alpha=0.1,n.cores=8)
+legend("bottomright",legend=levels(vsp),pch=20,col=ident.colors,bty="n",pt.cex=1,cex=0.6)
+title(main="Velocyto: RNA velocity on tSNE projection")
+dev.off()
+```
+
+```{r}
+knitr::include_graphics(file.path(path_export,"velocyto-stromapericyte-tsne.png"))
+```
+
+`r fc(name="velocity_stromapericyte_tsne",caption="_RNA velocity vector field visualised over a tSNE projection. Dataset shown is subsetted stroma and pericytes._")` 
+
+```{r}
+knitr::include_graphics(file.path(path_export,"velocyto-stromapericyte-umap.png"))
+```
+
+`r fc(name="velocity_stromapericyte_tsne",caption="_RNA velocity vector field visualised over a UMAP projection. Dataset shown is subetted stroma and pericytes._")` 
+
+# External data
+
+The fetal-maternal (FM) interface 10X dataset from [Vento-Tormo et al. 2018](https://www.nature.com/articles/s41586-018-0698-6) was downloaded from [ArrayExpress](https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6701/).
+
+```{r}
+#' @title fix_genes
+#' @description Function to convert ensembl gene ids to gene names in fetal-maternal seurat object.
+#' @param obj A seurat object.
+#'
+fix_genes <- function(obj) {
+  
+  # find unduplicated genes
+  genes_list <- rownames(GetAssayData(obj,slot="counts"))
+  genes_to_keep <- !duplicated(sub("-ENS.+$","",genes_list))
+  orig_genes_to_keep <- genes_list[genes_to_keep]
+    
+  # slim down
+  obj <- DietSeurat(obj,features=orig_genes_to_keep)
+  
+  # fix gene names
+  rownames(obj@assays$RNA@counts) <- sub("-ENS.+$","",rownames(obj@assays$RNA@counts))
+  rownames(obj@assays$RNA@data) <- sub("-ENS.+$","",rownames(obj@assays$RNA@data))
+  obj@assays$RNA@meta.features <- obj@assays$RNA@meta.features[genes_to_keep,]
+  rownames(obj@assays$RNA@meta.features) <- sub("-ENS.+$","",rownames(obj@assays$RNA@meta.features))
+  obj@assays$RNA@var.features <- character()
+
+  return(obj)
+}
+```
+
+From the FM data, decidua samples are selected and ensembl gene ids are converted to gene names.
+
+```{r}
+set.seed(123)
+
+f <- readRDS("data/processed/fetal-maternal/emtab-6701.Rds")
+
+# keep decidua samples
+soi <- c("FCA7167222","FCA7167224","FCA7167226","FCA7196219","FCA7196225","FCA7474063")
+soi <- rownames(f[[]][f[[]]$orig.ident %in% soi,])
+f <- subset(f,cells=soi)
+
+# change ens to gene name
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+f <- fix_genes(f)
+```
+
+## Stroma+Pericyte
+
+Storma and pericyte cell types are subsetted for reanalysis.
+
+```{r,fig.height=6,fig.width=8}
+f1 <- subset(f,subset=annotation %in% c("dS1","dS2","dS3","dP1","dP2"))
+f1 <- NormalizeData(f1)
+f1 <- ScaleData(f1,vars.to.regress=c("nFeature_RNA"))
+f1 <- FindVariableFeatures(f1,selection.method="vst",nfeatures=5000)
+f1 <- RunPCA(f1,verbose=F,seed.use=100)
+f1 <- RunTSNE(f1,dims=1:13,seed.use=100)
+f1 <- RunUMAP(f1,dims=1:13,seed.use=100)
+UMAPPlot(f1)
+```
+
+`r fc(name="umap_vento_stromapericyte",caption="_UMAP scatterplot showing stromal and pericyte cells._")` 
+
+## Integration
+
+FM decidua and endo datasets are merged and integrated (over individuals/runs), followed by standard Seurat processing.
+
+```{r}
+DefaultAssay(f) <- "RNA"
+f <- DietSeurat(f,assays="RNA")
+f$batch <- "fm"
+
+DefaultAssay(e) <- "RNA"
+e1 <- DietSeurat(e,assays="RNA")
+e1$batch <- "en"
+
+efm <- merge(e1,f)
+efm.list <- SplitObject(efm,split.by="orig.ident")
+
+for(i in 1:length(efm.list)) {
+    efm.list[[i]] <- NormalizeData(efm.list[[i]], verbose=FALSE)
+    efm.list[[i]] <- FindVariableFeatures(efm.list[[i]], selection.method="vst",
+        nfeatures=5000, verbose=FALSE)
+}
+
+efm.features <- SelectIntegrationFeatures(efm.list,nfeatures=5000)
+efm.anchors <- FindIntegrationAnchors(object.list=efm.list,anchor.features=efm.features)
+efm <- IntegrateData(anchorset=efm.anchors)
+DefaultAssay(efm) <- "integrated"
+efm <- ScaleData(efm)
+Idents(efm) <- efm$orig.ident
+efm
+
+efm <- RunPCA(efm,verbose=F,seed.use=42)
+efm <- RunTSNE(efm,dims=1:30,seed.use=100)
+efm <- RunUMAP(efm,dims=1:30,seed.use=100)
+```
+
+```{r}
+rm(f,e1,efm.list,efm.features,efm.anchors)
+```
+
+Dataset prefix is added to cell type annotations to enable identification of cells.
+
+```{r}
+efm$annotation1 <- recode(efm$annotation,`dM1`="M",`dM2`="M",`dM3`="M",`dNK1`="Immune",`dNK2`="Immune",`dNK3`="Immune",`Endo (f)`="Endothelial",`Endo (m)`="Endothelial",`Endo L`="Endothelial",`Epi1`="Epithelial",`Epi2`="Epithelial",`fFB1`="Fibroblast",`fFB2`="Fibroblast",`dS1`="Stromal",`dS2`="Stromal",`dS3`="Stromal",`dP1`="Pericyte",`dP2`="Pericyte",`Stroma5`="Myofibroblast",`Tcells`="Immune")
+
+efm$type <- ifelse(is.na(efm$annotation1),paste0("en-",efm$cell_type),paste0("fm-",efm$annotation1))
+efm$subtype <- ifelse(is.na(efm$annotation1),paste0("en-",efm$cell_subtype),paste0("fm-",efm$annotation1))
+
+#saveRDS(efm,file.path(path_export,"seurat-fetal-maternal-combined.Rds"))
+```
+
+```{r,fig.height=9,fig.width=7}
+TSNEPlot(efm,group.by="type")+
+  guides(color=guide_legend(nrow=6,override.aes=list(size=2)))+
+  theme(legend.position="top")
+```
+
+`r fc(name="external_full_tsne",caption="_tSNE scatterplot showing FM dataset integrated with current data._")` 
+# Session
+
+R packages in use and versions.
+
+```{r,echo=FALSE}
+sessionInfo()
+```
+
+---
+
+```{r,echo=FALSE,results="asis"}
+Sys.time() - start_time
+```
+
